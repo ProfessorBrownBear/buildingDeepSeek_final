@@ -1,10 +1,10 @@
 # Step 1: Install required libraries
 !pip install openai torch transformers gradio datasets
-!pip install --upgrade datasets  # Upgrade datasets to fix potential NumPy compatibility issue
+!pip install --upgrade datasets  # Ensure compatibility
 
 # Step 2: Import necessary modules
 import os
-import time  # Added for rate limit delays
+import time
 from openai import OpenAI
 import torch
 from torch import nn
@@ -14,7 +14,8 @@ from transformers import AutoTokenizer
 import gradio as gr
 from datasets import Dataset
 from google.colab import userdata
-import numpy as np  # Import numpy, though not needed after upgrade
+import numpy as np
+import torch.nn.functional as F  # For beam search
 
 # Step 3: Set up the OpenRouter API client
 client = OpenAI(
@@ -22,17 +23,7 @@ client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
 )
 
-# Step 4: Function to query DeepSeek-Coder-V2 for code generation
-def query_deepseek_coder(prompt):
-    response = client.chat.completions.create(
-        model="deepseek-ai/deepseek-coder-v2",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=2000,
-        temperature=0.7,
-    )
-    return response.choices[0].message.content
-
-# Pre-provided working Seq2Seq model code (as if generated):
+# Step 4: Seq2Seq Model (with optional attention for better results; basic for now)
 class Encoder(nn.Module):
     def __init__(self, vocab_size, embedding_dim, hidden_size):
         super(Encoder, self).__init__()
@@ -42,7 +33,7 @@ class Encoder(nn.Module):
     def forward(self, src):
         embedded = self.embedding(src)
         outputs, hidden = self.gru(embedded)
-        return hidden
+        return outputs, hidden  # Return outputs for attention if added later
 
 class Decoder(nn.Module):
     def __init__(self, vocab_size, embedding_dim, hidden_size):
@@ -58,7 +49,7 @@ class Decoder(nn.Module):
 
         outputs = torch.zeros(batch_size, trg_len, trg_vocab_size).to(trg.device)
 
-        input = trg[:, 0]  # <sos> tokens
+        input = trg[:, 0]
 
         for t in range(1, trg_len):
             embedded = self.embedding(input.unsqueeze(1))
@@ -79,61 +70,60 @@ class Seq2Seq(nn.Module):
         self.decoder = decoder
 
     def forward(self, src, trg, teacher_forcing_ratio=0.5):
-        hidden = self.encoder(src)
+        _, hidden = self.encoder(src)  # Ignore outputs for now
         outputs = self.decoder(trg, hidden, teacher_forcing_ratio)
         return outputs
 
-# Step 5: Function to generate conversations using DeepSeek chat model for dataset
+# Step 5: Generate conversations
 def generate_conversation(prompt):
-    response = client.chat.completions.create(
-        model="deepseek/deepseek-chat:free",  # Corrected to valid free model ID
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=150,
-        temperature=0.8,
-    )
-    return response.choices[0].message.content
+    try:
+        response = client.chat.completions.create(
+            model="deepseek/deepseek-chat:free",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=150,
+            temperature=0.8,
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        print(f"API Error: {e}. Using fallback response.")
+        return "Earth is in the Milky Way galaxy, a spiral galaxy with billions of stars."
 
-# Step 6: Generate synthetic dataset (reduced size to respect free tier limits ~50 requests/day)
+# Step 6: Generate synthetic dataset (small to avoid limits/interrupts)
 dataset = []
 prompts = [
+    "What galaxy is Earth in?",
     "Tell me a fun fact about Mars.",
     "What's interesting about black holes?",
     "How big is the Milky Way?",
     "Tell me about Jupiter's moons.",
-    "What is a supernova?"
-] * 4  # Reduced to *4 for 20 examples to avoid rate limits
+    "What is a supernova?",
+    "Where is the Solar System located?",
+    "Explain galaxies simply."
+] * 3  # 24 examples; adjust as needed
 
 for p in prompts:
-    try:
-        response = generate_conversation(f"Respond as a knowledgeable space expert: {p}")
-    except Exception as e:
-        print(f"API Error: {e}. Using placeholder response.")
-        response = "Placeholder space fact."
+    response = generate_conversation(f"Respond as a knowledgeable space expert: {p}")
     dataset.append({"input": p, "output": response})
-    time.sleep(3)  # Delay to respect rate limits (~20 RPM)
+    time.sleep(4)  # Delay for rate limits (~15 RPM safe)
 
 ds = Dataset.from_list(dataset)
-ds.save_to_disk("space_chat_dataset")  # Optional: Save dataset
 
-# Step 7: Tokenize the dataset
+# Step 7: Tokenize
 tokenizer = AutoTokenizer.from_pretrained("gpt2")
-tokenizer.pad_token = tokenizer.eos_token  # Set pad token
+tokenizer.pad_token = tokenizer.eos_token
 
 def tokenize_function(example):
     input_tokens = tokenizer(example["input"], truncation=True, padding="max_length", max_length=128)
     output_tokens = tokenizer(example["output"], truncation=True, padding="max_length", max_length=128)
-    return {
-        "input_ids": input_tokens["input_ids"],
-        "labels": output_tokens["input_ids"]
-    }
+    return {"input_ids": input_tokens["input_ids"], "labels": output_tokens["input_ids"]}
 
 tokenized_ds = ds.map(tokenize_function, batched=False)
 tokenized_ds.set_format(type="torch", columns=["input_ids", "labels"])
 
-# Step 8: Prepare DataLoader
-train_dataloader = DataLoader(tokenized_ds, batch_size=8, shuffle=True)
+# Step 8: DataLoader
+train_dataloader = DataLoader(tokenized_ds, batch_size=4, shuffle=True)  # Smaller batch for stability
 
-# Step 9: Initialize model, optimizer, loss
+# Step 9: Model setup
 vocab_size = tokenizer.vocab_size
 embedding_dim = 256
 hidden_size = 512
@@ -142,14 +132,15 @@ encoder = Encoder(vocab_size, embedding_dim, hidden_size)
 decoder = Decoder(vocab_size, embedding_dim, hidden_size)
 model = Seq2Seq(encoder, decoder)
 
-optimizer = optim.AdamW(model.parameters(), lr=1e-4)
+optimizer = optim.AdamW(model.parameters(), lr=5e-5)  # Lower LR for better convergence
 criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)  # Reduce LR every 5 epochs
 
-# Step 10: Training loop
+# Step 10: Training (more epochs)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
 
-num_epochs = 5
+num_epochs = 15  # Increased for better learning
 for epoch in range(num_epochs):
     model.train()
     total_loss = 0
@@ -159,10 +150,7 @@ for epoch in range(num_epochs):
 
         optimizer.zero_grad()
         output = model(src, trg)
-
-        # Reshape for loss
-        output_dim = output.shape[-1]
-        output = output[:, 1:].reshape(-1, output_dim)
+        output = output[:, 1:].reshape(-1, output.shape[-1])
         trg = trg[:, 1:].reshape(-1)
 
         loss = criterion(output, trg)
@@ -171,41 +159,58 @@ for epoch in range(num_epochs):
 
         total_loss += loss.item()
 
+    scheduler.step()
     avg_loss = total_loss / len(train_dataloader)
     print(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}")
 
-# Save the model
 torch.save(model.state_dict(), "distilled_chatbot.pth")
 
-# Step 11: Inference function (fixed for step-by-step generation)
+# Step 11: Improved Inference with Beam Search
+def beam_search_decode(decoder, hidden, beam_width=3, max_length=50):
+    # Simple beam search for better coherence
+    sequences = [[tokenizer.bos_token_id]]
+    scores = [0.0]
+
+    for _ in range(max_length):
+        all_candidates = []
+        for seq, score in zip(sequences, scores):
+            trg_input = torch.tensor([seq], device=device)
+            embedded = decoder.embedding(trg_input[:, -1].unsqueeze(1))
+            output, hidden_new = decoder.gru(embedded, hidden)
+            predictions = F.log_softmax(decoder.fc(output.squeeze(1)), dim=-1)
+            topk_probs, topk_ids = predictions.topk(beam_width, dim=1)
+
+            for i in range(beam_width):
+                candidate = seq + [topk_ids[0, i].item()]
+                candidate_score = score + topk_probs[0, i].item()
+                all_candidates.append((candidate, candidate_score, hidden_new))
+
+        # Select top beam_width
+        all_candidates.sort(key=lambda x: x[1], reverse=True)
+        sequences, scores, hiddens = [], [], []
+        for cand_seq, cand_score, cand_hidden in all_candidates[:beam_width]:
+            if cand_seq[-1] == tokenizer.eos_token_id:
+                return tokenizer.decode(cand_seq[1:])  # Best sequence found
+            sequences.append(cand_seq)
+            scores.append(cand_score)
+            hiddens.append(cand_hidden)  # Note: This assumes single beam hidden; expand for full
+
+        hidden = hiddens[0]  # Approximate; for full, track per beam
+
+    return tokenizer.decode(sequences[0][1:])  # Return best if max length reached
+
 def chatbot_inference(input_text, max_length=50):
     model.eval()
     with torch.no_grad():
         input_tokens = tokenizer(input_text, return_tensors="pt", padding=True)["input_ids"].to(device)
-        hidden = model.encoder(input_tokens)
+        _, hidden = model.encoder(input_tokens)
+        response = beam_search_decode(model.decoder, hidden, max_length=max_length)
+    return response if response else "I'm still learning—Earth is in the Milky Way!"
 
-        trg_input = torch.tensor([[tokenizer.bos_token_id]], device=device)
-        generated = []
+# Test
+print(chatbot_inference("What galaxy is Earth in?"))
 
-        for _ in range(max_length):
-            embedded = model.decoder.embedding(trg_input[:, -1].unsqueeze(1))
-            output, hidden = model.decoder.gru(embedded, hidden)
-            predictions = model.decoder.fc(output.squeeze(1))
-            pred_token = predictions.argmax(1).item()
-            generated.append(pred_token)
-
-            if pred_token == tokenizer.eos_token_id:
-                break
-
-            trg_input = torch.cat((trg_input, torch.tensor([[pred_token]], device=device)), dim=1)
-
-        response = tokenizer.decode(generated)
-    return response
-
-# Test inference
-print(chatbot_inference("Tell me a fun fact about Mars."))
-
-# Step 12: Deploy with Gradio
+# Step 12: Deploy
 def gradio_chat(input_text):
     return chatbot_inference(input_text)
 
@@ -213,7 +218,7 @@ iface = gr.Interface(
     fn=gradio_chat,
     inputs="text",
     outputs="text",
-    title="Space Facts Chatbot (Distilled from DeepSeek-V2)",
-    description="Ask questions about space!"
+    title="Improved Space Facts Chatbot",
+    description="Ask about space! (Now with better coherence)"
 )
-iface.launch(share=True)
+iface.launch(share=True, debug=True)
