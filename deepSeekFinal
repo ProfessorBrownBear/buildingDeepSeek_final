@@ -1,0 +1,219 @@
+# Step 1: Install required libraries
+!pip install openai torch transformers gradio datasets
+!pip install --upgrade datasets  # Upgrade datasets to fix potential NumPy compatibility issue
+
+# Step 2: Import necessary modules
+import os
+import time  # Added for rate limit delays
+from openai import OpenAI
+import torch
+from torch import nn
+from torch.utils.data import DataLoader
+import torch.optim as optim
+from transformers import AutoTokenizer
+import gradio as gr
+from datasets import Dataset
+from google.colab import userdata
+import numpy as np  # Import numpy, though not needed after upgrade
+
+# Step 3: Set up the OpenRouter API client
+client = OpenAI(
+    api_key=userdata.get('OPENROUTER_API_KEY'),
+    base_url="https://openrouter.ai/api/v1",
+)
+
+# Step 4: Function to query DeepSeek-Coder-V2 for code generation
+def query_deepseek_coder(prompt):
+    response = client.chat.completions.create(
+        model="deepseek-ai/deepseek-coder-v2",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=2000,
+        temperature=0.7,
+    )
+    return response.choices[0].message.content
+
+# Pre-provided working Seq2Seq model code (as if generated):
+class Encoder(nn.Module):
+    def __init__(self, vocab_size, embedding_dim, hidden_size):
+        super(Encoder, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, embedding_dim)
+        self.gru = nn.GRU(embedding_dim, hidden_size, batch_first=True)
+
+    def forward(self, src):
+        embedded = self.embedding(src)
+        outputs, hidden = self.gru(embedded)
+        return hidden
+
+class Decoder(nn.Module):
+    def __init__(self, vocab_size, embedding_dim, hidden_size):
+        super(Decoder, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, embedding_dim)
+        self.gru = nn.GRU(embedding_dim, hidden_size, batch_first=True)
+        self.fc = nn.Linear(hidden_size, vocab_size)
+
+    def forward(self, trg, hidden, teacher_forcing_ratio=0.5):
+        batch_size = trg.shape[0]
+        trg_len = trg.shape[1]
+        trg_vocab_size = self.fc.out_features
+
+        outputs = torch.zeros(batch_size, trg_len, trg_vocab_size).to(trg.device)
+
+        input = trg[:, 0]  # <sos> tokens
+
+        for t in range(1, trg_len):
+            embedded = self.embedding(input.unsqueeze(1))
+            output, hidden = self.gru(embedded, hidden)
+            predictions = self.fc(output.squeeze(1))
+            outputs[:, t] = predictions
+
+            teacher_force = torch.rand(1).item() < teacher_forcing_ratio
+            top1 = predictions.argmax(1)
+            input = trg[:, t] if teacher_force else top1
+
+        return outputs
+
+class Seq2Seq(nn.Module):
+    def __init__(self, encoder, decoder):
+        super(Seq2Seq, self).__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+
+    def forward(self, src, trg, teacher_forcing_ratio=0.5):
+        hidden = self.encoder(src)
+        outputs = self.decoder(trg, hidden, teacher_forcing_ratio)
+        return outputs
+
+# Step 5: Function to generate conversations using DeepSeek chat model for dataset
+def generate_conversation(prompt):
+    response = client.chat.completions.create(
+        model="deepseek/deepseek-chat:free",  # Corrected to valid free model ID
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=150,
+        temperature=0.8,
+    )
+    return response.choices[0].message.content
+
+# Step 6: Generate synthetic dataset (reduced size to respect free tier limits ~50 requests/day)
+dataset = []
+prompts = [
+    "Tell me a fun fact about Mars.",
+    "What's interesting about black holes?",
+    "How big is the Milky Way?",
+    "Tell me about Jupiter's moons.",
+    "What is a supernova?"
+] * 4  # Reduced to *4 for 20 examples to avoid rate limits
+
+for p in prompts:
+    try:
+        response = generate_conversation(f"Respond as a knowledgeable space expert: {p}")
+    except Exception as e:
+        print(f"API Error: {e}. Using placeholder response.")
+        response = "Placeholder space fact."
+    dataset.append({"input": p, "output": response})
+    time.sleep(3)  # Delay to respect rate limits (~20 RPM)
+
+ds = Dataset.from_list(dataset)
+ds.save_to_disk("space_chat_dataset")  # Optional: Save dataset
+
+# Step 7: Tokenize the dataset
+tokenizer = AutoTokenizer.from_pretrained("gpt2")
+tokenizer.pad_token = tokenizer.eos_token  # Set pad token
+
+def tokenize_function(example):
+    input_tokens = tokenizer(example["input"], truncation=True, padding="max_length", max_length=128)
+    output_tokens = tokenizer(example["output"], truncation=True, padding="max_length", max_length=128)
+    return {
+        "input_ids": input_tokens["input_ids"],
+        "labels": output_tokens["input_ids"]
+    }
+
+tokenized_ds = ds.map(tokenize_function, batched=False)
+tokenized_ds.set_format(type="torch", columns=["input_ids", "labels"])
+
+# Step 8: Prepare DataLoader
+train_dataloader = DataLoader(tokenized_ds, batch_size=8, shuffle=True)
+
+# Step 9: Initialize model, optimizer, loss
+vocab_size = tokenizer.vocab_size
+embedding_dim = 256
+hidden_size = 512
+
+encoder = Encoder(vocab_size, embedding_dim, hidden_size)
+decoder = Decoder(vocab_size, embedding_dim, hidden_size)
+model = Seq2Seq(encoder, decoder)
+
+optimizer = optim.AdamW(model.parameters(), lr=1e-4)
+criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+
+# Step 10: Training loop
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
+
+num_epochs = 5
+for epoch in range(num_epochs):
+    model.train()
+    total_loss = 0
+    for batch in train_dataloader:
+        src = batch["input_ids"].to(device)
+        trg = batch["labels"].to(device)
+
+        optimizer.zero_grad()
+        output = model(src, trg)
+
+        # Reshape for loss
+        output_dim = output.shape[-1]
+        output = output[:, 1:].reshape(-1, output_dim)
+        trg = trg[:, 1:].reshape(-1)
+
+        loss = criterion(output, trg)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    avg_loss = total_loss / len(train_dataloader)
+    print(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}")
+
+# Save the model
+torch.save(model.state_dict(), "distilled_chatbot.pth")
+
+# Step 11: Inference function (fixed for step-by-step generation)
+def chatbot_inference(input_text, max_length=50):
+    model.eval()
+    with torch.no_grad():
+        input_tokens = tokenizer(input_text, return_tensors="pt", padding=True)["input_ids"].to(device)
+        hidden = model.encoder(input_tokens)
+
+        trg_input = torch.tensor([[tokenizer.bos_token_id]], device=device)
+        generated = []
+
+        for _ in range(max_length):
+            embedded = model.decoder.embedding(trg_input[:, -1].unsqueeze(1))
+            output, hidden = model.decoder.gru(embedded, hidden)
+            predictions = model.decoder.fc(output.squeeze(1))
+            pred_token = predictions.argmax(1).item()
+            generated.append(pred_token)
+
+            if pred_token == tokenizer.eos_token_id:
+                break
+
+            trg_input = torch.cat((trg_input, torch.tensor([[pred_token]], device=device)), dim=1)
+
+        response = tokenizer.decode(generated)
+    return response
+
+# Test inference
+print(chatbot_inference("Tell me a fun fact about Mars."))
+
+# Step 12: Deploy with Gradio
+def gradio_chat(input_text):
+    return chatbot_inference(input_text)
+
+iface = gr.Interface(
+    fn=gradio_chat,
+    inputs="text",
+    outputs="text",
+    title="Space Facts Chatbot (Distilled from DeepSeek-V2)",
+    description="Ask questions about space!"
+)
+iface.launch(share=True)
